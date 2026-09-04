@@ -1,0 +1,4 @@
+# build outputs
+*.img
+# local build cache if someone points it here
+work/
