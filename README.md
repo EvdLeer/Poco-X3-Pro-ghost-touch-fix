@@ -2,7 +2,9 @@
 
 Random phantom taps, ghost scrolling, text selecting itself, buttons pressing
 on their own - the infamous POCO X3 Pro **ghost touch** problem, on LineageOS
-and other custom ROMs. This repository contains a minimal, verifiable fix:
+and other custom ROMs.
+
+This repository contains a minimal, verifiable fix:
 the touch controller firmware from **MIUI V12.5.5.0.RJUIDXM**, a firmware
 version that has been used by existing vayu kernels to address the
 ghost-touch issue, plus the tooling to get it into an otherwise **stock
