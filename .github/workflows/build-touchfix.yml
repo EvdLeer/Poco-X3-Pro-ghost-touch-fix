@@ -1,9 +1,15 @@
-# Put this file at .github/workflows/build-touchfix.yml on your default branch.
-# Prepared for EvdLeer/Poco-X3-Pro-ghost-touch-fix, commit d7693162fb6e.
-# Requires build-touchfix.sh and firmware/ from that repository.
+# Builds ghost-touch-fixed boot images for official LineageOS vayu nightlies
+# and publishes them as prereleases, one release per nightly build date.
+# Requires build-touchfix.sh and firmware/ from this repository.
 # No personal access token or self-hosted runner is needed.
-# Automatic runs check the latest supported build; use Run workflow to select
-# another build date while its original boot.img is still on the official server.
+#
+# Automatic (scheduled) runs pick the newest available build that has no
+# release yet, so older builds still on the official server are backfilled
+# one per run. Use "Run workflow" with an empty build date for the same
+# behaviour on demand, or enter a date to (re)build that specific build.
+# When upstream LineageOS starts shipping the fix firmware itself, the run
+# records an obsolete marker tag (touchfix-skip-<version>-<date>) so later
+# runs stop retrying that build.
 
 name: Build vayu touchfix
 
@@ -11,11 +17,11 @@ on:
   workflow_dispatch:
     inputs:
       build_date:
-        description: 'Build date (YYYYMMDD); leave empty for the latest 22.2 build'
+        description: 'Build date (YYYYMMDD); leave empty for the newest build without a release'
         required: false
         type: string
   schedule:
-    # Daily at 05:23 UTC. Existing releases are skipped.
+    # Daily at 05:23 UTC. Builds with an existing release are skipped.
     - cron: '23 5 * * *'
 
 permissions:
@@ -46,6 +52,7 @@ jobs:
       - name: Select the original LineageOS boot image
         id: source
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUESTED_DATE: ${{ inputs.build_date }}
         run: |
           mkdir -p "$RUNNER_TEMP/touchfix/input" "$RUNNER_TEMP/touchfix/release"
@@ -53,6 +60,10 @@ jobs:
             --proto '=https' --proto-redir '=https' --max-time 120 \
             "https://download.lineageos.org/api/v2/devices/$DEVICE/builds" \
             --output "$RUNNER_TEMP/touchfix/builds.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/touchfix/releases.json" || echo '[]' > "$RUNNER_TEMP/touchfix/releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+            > "$RUNNER_TEMP/touchfix/tags.json" || echo '[]' > "$RUNNER_TEMP/touchfix/tags.json"
           python3 - <<'PY'
           import datetime
           import json
@@ -64,6 +75,14 @@ jobs:
           root = Path(os.environ['RUNNER_TEMP']) / 'touchfix'
           version, device = os.environ['LINEAGE_VERSION'], os.environ['DEVICE']
           requested = os.environ.get('REQUESTED_DATE', '').strip()
+
+          def skip(message):
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write(message + '\n')
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('needed=false\n')
+              raise SystemExit(0)
+
           if requested:
               if not re.fullmatch(r'[0-9]{8}', requested):
                   raise SystemExit('Build date must be YYYYMMDD.')
@@ -71,23 +90,52 @@ jobs:
           builds = json.loads((root / 'builds.json').read_text())
           if not isinstance(builds, list):
               raise SystemExit('Unexpected LineageOS API response; no image will be built.')
+
+          def load_pages(name):
+              text = (root / name).read_text().strip() or '[]'
+              pages = json.loads(text)
+              return [item for page in pages
+                      for item in (page if isinstance(page, list) else [page])]
+
+          release_pattern = re.compile(
+              rf'touchfix-{re.escape(version)}-([0-9]{{8}})-[0-9a-f]+')
+          released = {match[1] for release in load_pages('releases.json')
+                      if (match := release_pattern.fullmatch(release.get('tag_name', '')))}
+          marker_pattern = re.compile(
+              rf'touchfix-skip-{re.escape(version)}-([0-9]{{8}})')
+          skipped = {match[1] for tag in load_pages('tags.json')
+                     if (match := marker_pattern.fullmatch(tag.get('name', '')))}
+
           pattern = re.compile(
               rf'lineage-{re.escape(version)}-([0-9]{{8}})-nightly-{re.escape(device)}-signed\.zip'
           )
-          candidates = []
+          candidates = {}
           for build in builds:
               if str(build.get('version')) != version or build.get('type') != 'nightly':
                   continue
               for entry in build.get('files', []):
                   match = pattern.fullmatch(entry.get('filename', ''))
-                  if match and (not requested or match[1] == requested):
-                      candidates.append((match[1], build))
-          if not candidates:
-              raise SystemExit(
-                  f'No official {device} LineageOS {version} build found for '
-                  f'{requested or "the latest build"}. Old downloads may have been removed.'
-              )
-          build_date, build = max(candidates, key=lambda candidate: candidate[0])
+                  if match:
+                      candidates[match[1]] = build
+          if requested:
+              if requested not in candidates:
+                  raise SystemExit(
+                      f'No official {device} LineageOS {version} build found for '
+                      f'{requested}. Old downloads may have been removed.'
+                  )
+              if requested in released:
+                  skip(f'Build {requested} already has a release. Skipped.')
+              build_date = requested
+          else:
+              if not candidates:
+                  skip(f'No official {device} LineageOS {version} builds are '
+                       'currently listed; nothing to do.')
+              todo = sorted(set(candidates) - released - skipped, reverse=True)
+              if not todo:
+                  skip('Every available build already has a release or an '
+                       'obsolete marker. Nothing to do.')
+              build_date = todo[0]
+          build = candidates[build_date]
           boots = [entry for entry in build['files'] if entry.get('filename') == 'boot.img']
           if len(boots) != 1:
               raise SystemExit('Expected exactly one boot.img in the selected build.')
@@ -118,44 +166,29 @@ jobs:
           (root / 'release' / 'build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
           (root / 'release' / 'lineage-build.json').write_text(json.dumps(build, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in {'date': build_date, 'url': url, 'sha256': sha256, 'tag': tag}.items():
+              values = {'needed': 'true', 'date': build_date, 'url': url,
+                        'sha256': sha256, 'tag': tag}
+              for key, value in values.items():
                   output.write(f'{key}={value}\n')
           PY
 
-      - name: Check whether this build and fix revision already have a release
-        id: existing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.source.outputs.tag }}
-        run: |
-          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            > "$RUNNER_TEMP/touchfix/releases.json"
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          pages = json.loads((Path(os.environ['RUNNER_TEMP']) / 'touchfix/releases.json').read_text())
-          exists = any(release['tag_name'] == os.environ['RELEASE_TAG']
-                       for page in pages for release in page)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'needed={str(not exists).lower()}\n')
-          if exists:
-              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-                  summary.write('This build and fix revision already have a release. Skipped.\n')
-          PY
-
-      - name: Install build dependencies
-        if: steps.existing.outputs.needed == 'true'
+      - name: Install build dependencies and free up disk space
+        if: steps.source.outputs.needed == 'true'
         run: |
           test -f ./build-touchfix.sh
           test -d ./firmware
+          # The kernel build needs roughly 10 GB in ~/.cache; drop the largest
+          # preinstalled toolcaches to guarantee headroom on the runner disk.
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc g++ make bc openssl python3 binutils curl tar libssl-dev \
             git ca-certificates xz-utils unzip bison flex libelf-dev
 
       - name: Download and verify the original boot image
-        if: steps.existing.outputs.needed == 'true'
+        if: steps.source.outputs.needed == 'true'
         env:
           BOOT_URL: ${{ steps.source.outputs.url }}
           BOOT_SHA256: ${{ steps.source.outputs.sha256 }}
@@ -168,7 +201,10 @@ jobs:
 
       - name: Build the modified image using the original kernel revision
         id: kernel
-        if: steps.existing.outputs.needed == 'true'
+        if: steps.source.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_DATE: ${{ steps.source.outputs.date }}
         run: |
           # Do not pass a branch/ref override: the script must use the revision
           # embedded in the original boot.img, as described in the README.
@@ -186,6 +222,12 @@ jobs:
             echo 'built=false' >> "$GITHUB_OUTPUT"
             echo 'LineageOS already includes both firmware blobs. No modified image is needed.' \
               >> "$GITHUB_STEP_SUMMARY"
+            # Record a marker tag so later runs stop retrying this build.
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/touchfix-skip-$LINEAGE_VERSION-$BUILD_DATE" \
+              -f sha="$GITHUB_SHA" >/dev/null \
+              && echo 'Recorded obsolete marker tag.' \
+              || echo 'Could not record the obsolete marker tag (it may already exist).'
             exit 0
           fi
           if (( ${#images[@]} != 1 )); then
