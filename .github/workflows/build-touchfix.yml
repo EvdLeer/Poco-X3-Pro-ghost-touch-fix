@@ -1,0 +1,266 @@
+# Put this file at .github/workflows/build-touchfix.yml on your default branch.
+# Prepared for EvdLeer/Poco-X3-Pro-ghost-touch-fix, commit d7693162fb6e.
+# Requires build-touchfix.sh and firmware/ from that repository.
+# No personal access token or self-hosted runner is needed.
+# Automatic runs check the latest supported build; use Run workflow to select
+# another build date while its original boot.img is still on the official server.
+
+name: Build vayu touchfix
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_date:
+        description: 'Build date (YYYYMMDD); leave empty for the latest 22.2 build'
+        required: false
+        type: string
+  schedule:
+    # Daily at 05:23 UTC. Existing releases are skipped.
+    - cron: '23 5 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vayu-touchfix
+  cancel-in-progress: false
+
+env:
+  LINEAGE_VERSION: '22.2'
+  DEVICE: vayu
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out the touchfix repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Select the original LineageOS boot image
+        id: source
+        env:
+          REQUESTED_DATE: ${{ inputs.build_date }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/touchfix/input" "$RUNNER_TEMP/touchfix/release"
+          curl --fail --silent --show-error --location --retry 3 \
+            --proto '=https' --proto-redir '=https' --max-time 120 \
+            "https://download.lineageos.org/api/v2/devices/$DEVICE/builds" \
+            --output "$RUNNER_TEMP/touchfix/builds.json"
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from urllib.parse import urlparse
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'touchfix'
+          version, device = os.environ['LINEAGE_VERSION'], os.environ['DEVICE']
+          requested = os.environ.get('REQUESTED_DATE', '').strip()
+          if requested:
+              if not re.fullmatch(r'[0-9]{8}', requested):
+                  raise SystemExit('Build date must be YYYYMMDD.')
+              datetime.datetime.strptime(requested, '%Y%m%d')
+          builds = json.loads((root / 'builds.json').read_text())
+          if not isinstance(builds, list):
+              raise SystemExit('Unexpected LineageOS API response; no image will be built.')
+          pattern = re.compile(
+              rf'lineage-{re.escape(version)}-([0-9]{{8}})-nightly-{re.escape(device)}-signed\.zip'
+          )
+          candidates = []
+          for build in builds:
+              if str(build.get('version')) != version or build.get('type') != 'nightly':
+                  continue
+              for entry in build.get('files', []):
+                  match = pattern.fullmatch(entry.get('filename', ''))
+                  if match and (not requested or match[1] == requested):
+                      candidates.append((match[1], build))
+          if not candidates:
+              raise SystemExit(
+                  f'No official {device} LineageOS {version} build found for '
+                  f'{requested or "the latest build"}. Old downloads may have been removed.'
+              )
+          build_date, build = max(candidates, key=lambda candidate: candidate[0])
+          boots = [entry for entry in build['files'] if entry.get('filename') == 'boot.img']
+          if len(boots) != 1:
+              raise SystemExit('Expected exactly one boot.img in the selected build.')
+          boot = boots[0]
+          sha256 = str(boot.get('sha256', '')).lower()
+          if not re.fullmatch(r'[0-9a-f]{64}', sha256):
+              raise SystemExit('Official boot.img SHA256 is missing or invalid.')
+          url = boot.get('url', '')
+          parsed = urlparse(url)
+          host = parsed.hostname or ''
+          if (parsed.scheme != 'https' or parsed.username or parsed.password
+                  or not (host == 'lineageos.org' or host.endswith('.lineageos.org'))
+                  or any(ord(char) < 33 for char in url)):
+              raise SystemExit('Expected an HTTPS download URL from LineageOS.')
+          tag = f'touchfix-{version}-{build_date}-{os.environ["GITHUB_SHA"][:12]}'
+          metadata = {
+              'device': device,
+              'lineage_version': version,
+              'build_date': build_date,
+              'original_boot_url': url,
+              'original_boot_sha256': sha256,
+              'touchfix_repository': os.environ['GITHUB_REPOSITORY'],
+              'touchfix_commit': os.environ['GITHUB_SHA'],
+              'workflow_run': f'{os.environ["GITHUB_SERVER_URL"]}/{os.environ["GITHUB_REPOSITORY"]}'
+                              f'/actions/runs/{os.environ["GITHUB_RUN_ID"]}',
+              'hardware_test_status': 'Not tested by this workflow',
+          }
+          (root / 'release' / 'build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          (root / 'release' / 'lineage-build.json').write_text(json.dumps(build, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {'date': build_date, 'url': url, 'sha256': sha256, 'tag': tag}.items():
+                  output.write(f'{key}={value}\n')
+          PY
+
+      - name: Check whether this build and fix revision already have a release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/touchfix/releases.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          pages = json.loads((Path(os.environ['RUNNER_TEMP']) / 'touchfix/releases.json').read_text())
+          exists = any(release['tag_name'] == os.environ['RELEASE_TAG']
+                       for page in pages for release in page)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'needed={str(not exists).lower()}\n')
+          if exists:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('This build and fix revision already have a release. Skipped.\n')
+          PY
+
+      - name: Install build dependencies
+        if: steps.existing.outputs.needed == 'true'
+        run: |
+          test -f ./build-touchfix.sh
+          test -d ./firmware
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ make bc openssl python3 binutils curl tar libssl-dev \
+            git ca-certificates xz-utils unzip bison flex libelf-dev
+
+      - name: Download and verify the original boot image
+        if: steps.existing.outputs.needed == 'true'
+        env:
+          BOOT_URL: ${{ steps.source.outputs.url }}
+          BOOT_SHA256: ${{ steps.source.outputs.sha256 }}
+        run: |
+          cd "$RUNNER_TEMP/touchfix/input"
+          curl --fail --silent --show-error --location --retry 3 \
+            --proto '=https' --proto-redir '=https' --max-time 600 \
+            "$BOOT_URL" --output boot.img
+          printf '%s  boot.img\n' "$BOOT_SHA256" | sha256sum --check --strict
+
+      - name: Build the modified image using the original kernel revision
+        id: kernel
+        if: steps.existing.outputs.needed == 'true'
+        run: |
+          # Do not pass a branch/ref override: the script must use the revision
+          # embedded in the original boot.img, as described in the README.
+          # Bash pipefail makes a failed build fail this job, even when using tee.
+          # The script writes its final image to the caller's working directory.
+          mkdir -p "$RUNNER_TEMP/touchfix/output"
+          cd "$RUNNER_TEMP/touchfix/output"
+          bash "$GITHUB_WORKSPACE/build-touchfix.sh" "$RUNNER_TEMP/touchfix/input/boot.img" \
+            2>&1 | tee "$RUNNER_TEMP/touchfix/release/build.log"
+          shopt -s nullglob
+          images=(boot-touchfix-*.img)
+          if (( ${#images[@]} == 0 )) && \
+              grep -Fq 'This fix is obsolete for your build - stopping.' \
+                "$RUNNER_TEMP/touchfix/release/build.log"; then
+            echo 'built=false' >> "$GITHUB_OUTPUT"
+            echo 'LineageOS already includes both firmware blobs. No modified image is needed.' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if (( ${#images[@]} != 1 )); then
+            echo 'Expected one output image after a successful build.' >&2
+            exit 1
+          fi
+          echo 'built=true' >> "$GITHUB_OUTPUT"
+
+      - name: Collect the modified image, rollback image and checksums
+        if: steps.kernel.outputs.built == 'true'
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'touchfix'
+          dist = root / 'release'
+          metadata = json.loads((dist / 'build-info.json').read_text())
+          images = list((root / 'output').glob('boot-touchfix-*.img'))
+          if len(images) != 1:
+              raise SystemExit('Expected one build output image.')
+          fixed = images[0]
+          if fixed.stat().st_size == 0:
+              raise SystemExit('The build output is empty.')
+          original = root / 'input/boot.img'
+          original_hash = hashlib.sha256(original.read_bytes()).hexdigest()
+          if original_hash != metadata['original_boot_sha256']:
+              raise SystemExit('The build changed the original image; refusing to package it.')
+          modified_hash = hashlib.sha256(fixed.read_bytes()).hexdigest()
+          if original_hash == modified_hash:
+              raise SystemExit('The output is identical to the original; no touchfix release created.')
+          suffix = f'{metadata["device"]}-lineage-{metadata["lineage_version"]}-{metadata["build_date"]}.img'
+          fixed_name, original_name = f'boot-touchfix-{suffix}', f'boot-original-{suffix}'
+          shutil.copyfile(fixed, dist / fixed_name)
+          shutil.copyfile(original, dist / original_name)
+          metadata['script_output_filename'] = fixed.name
+          metadata['modified_boot_sha256'] = modified_hash
+          metadata['kernel_source_revision'] = fixed.stem.rsplit('-', 1)[1]
+          metadata['kernel_source_repository'] = 'https://github.com/LineageOS/android_kernel_xiaomi_sm8150'
+          (dist / 'build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          notes = (
+              f'Experimental touch firmware fix for POCO X3 Pro (vayu).\n\n'
+              f'Use only with **LineageOS {metadata["lineage_version"]}, build {metadata["build_date"]}**.\n\n'
+              'The kernel was built with this repository\'s build-touchfix.sh using an official boot.img. '
+              'Firmware: MIUI V12.5.5.0.RJUIDXM prod. This CI run does not test a physical phone.\n\n'
+              f'Install (unlocked bootloader; phone in fastboot mode):\n\n'
+              f'```sh\nfastboot flash boot {fixed_name}\nfastboot reboot\n```\n\n'
+              f'Rollback for the same ROM build:\n\n'
+              f'```sh\nfastboot flash boot {original_name}\nfastboot reboot\n```\n\n'
+              'Check SHA256SUMS before flashing. The original boot image is included for rollback. '
+              'A LineageOS OTA replaces the boot image; use an image matching the newly installed build.\n\n'
+              f'Source and build details: build-info.json, lineage-build.json and build.log.\n'
+          )
+          (root / 'release-notes.md').write_text(notes)
+          checksums = [f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n'
+                       for path in sorted(dist.iterdir()) if path.is_file()]
+          (dist / 'SHA256SUMS').write_text(''.join(checksums))
+          PY
+
+      - name: Publish an experimental release with downloadable images
+        if: steps.kernel.outputs.built == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          BUILD_DATE: ${{ steps.source.outputs.date }}
+        run: |
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/touchfix/release/"* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "vayu touchfix - LineageOS $LINEAGE_VERSION - $BUILD_DATE" \
+            --notes-file "$RUNNER_TEMP/touchfix/release-notes.md" \
+            --prerelease --latest=false
+          printf 'Download: %s/%s/releases/tag/%s\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$RELEASE_TAG" \
+            >> "$GITHUB_STEP_SUMMARY"
