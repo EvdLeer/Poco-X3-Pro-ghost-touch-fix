@@ -12,8 +12,9 @@ LineageOS kernel build, changing only the two embedded touchscreen firmware
 blobs**.
 
 ## Just want the fix?
-You do not need to build anything: ready-made images are published for each recent nightly - see
-[Option A - install a prebuilt image](#option-a---install-a-prebuilt-image-easiest).
+You do not need to build anything: ready-made images are published for each recent nightly;
+See [Option A - install a prebuilt image](#option-a---install-a-prebuilt-image-easiest).
+
 
 > ## ⚠️ Status: EXPERIMENTAL - under test
 >
