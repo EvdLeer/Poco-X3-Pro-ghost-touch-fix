@@ -11,8 +11,8 @@ ghost-touch issue, plus the tooling to get it into an otherwise **stock
 LineageOS kernel build, changing only the two embedded touchscreen firmware
 blobs**.
 
-**Just want the fix?** You do not need to build anything: ready-made images
-are published for each recent nightly - see
+## Just want the fix?
+You do not need to build anything: ready-made images are published for each recent nightly - see
 [Option A - install a prebuilt image](#option-a---install-a-prebuilt-image-easiest).
 
 > ## ⚠️ Status: EXPERIMENTAL - under test
