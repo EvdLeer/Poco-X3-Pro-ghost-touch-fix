@@ -9,6 +9,10 @@ ghost-touch issue, plus the tooling to get it into an otherwise **stock
 LineageOS kernel build, changing only the two embedded touchscreen firmware
 blobs**.
 
+**Just want the fix?** You do not need to build anything: ready-made images
+are published for each recent nightly - see
+[Option A - install a prebuilt image](#option-a---install-a-prebuilt-image-easiest).
+
 > ## ⚠️ Status: EXPERIMENTAL - under test
 >
 > | Device | Panel | ROM / build | Result | Since |
@@ -94,10 +98,57 @@ firmware/README.md   provenance: upstream source, commits, hashes
 patches/0001-*.patch git am-able patch for kernel maintainers
 build-touchfix.sh    end-to-end build script for end users
 read-panel.sh        reports your panel variant (Tianma/fw01 vs CSOT/fw02) via adb
+.github/workflows/   CI that builds a release for each LineageOS nightly
 LICENSE              GPL-2.0 (both scripts and the patch; see License below)
 ```
 
-## Option A - build it yourself (end users)
+## Option A - install a prebuilt image (easiest)
+
+Ready-made images for recent LineageOS nightlies are on the
+[Releases page](https://github.com/EvdLeer/Poco-X3-Pro-ghost-touch-fix/releases).
+You need a computer, a USB cable, a POCO X3 Pro that already runs official
+LineageOS 22.2 (so your bootloader is already unlocked), and Google's
+[platform-tools](https://developer.android.com/tools/releases/platform-tools)
+(the `fastboot` command) unpacked somewhere on that computer.
+
+1. On the phone, check which build you are running: Settings > About phone >
+   LineageOS version, for example `22.2-20260830-NIGHTLY-vayu`. The date is
+   the part that matters.
+2. Open the release whose title ends in that date and download
+   `boot-touchfix-vayu-lineage-22.2-<date>.img`. Also download
+   `boot-original-vayu-lineage-22.2-<date>.img` - that is your way back.
+   **Only flash images whose date exactly matches your installed build.**
+3. Switch the phone off. Hold Volume-down + Power until the FASTBOOT screen
+   appears, then connect the phone to the computer.
+4. Open a terminal (Windows: Command Prompt) in the folder with the
+   downloaded images and run:
+
+   ```
+   fastboot flash boot boot-touchfix-vayu-lineage-22.2-<date>.img
+   fastboot reboot
+   ```
+
+   (Windows: if `fastboot` is not recognized, run it from the platform-tools
+   folder, e.g. `C:\platform-tools\fastboot.exe`.)
+5. The phone boots normally. Apps, settings and data are untouched; only the
+   boot partition changed. The ghost touches should be gone.
+
+Going back is always possible: flash the `boot-original-...` image the same
+way. If the phone will not boot, fastboot mode (Volume-down + Power) always
+remains reachable.
+
+**After every LineageOS update (OTA)** the update restores the stock kernel
+and the ghost touches will return. Download and flash the image matching the
+new build; a release for each new nightly normally appears within a day.
+
+The prebuilt images are produced automatically by GitHub Actions
+([workflow](.github/workflows/build-touchfix.yml)) from an unmodified
+official LineageOS `boot.img` plus this repository's build script. Every
+release includes the full build log, checksums (`SHA256SUMS`) and source
+details, and is marked as a prerelease: CI does not test on a physical
+phone. The images are exactly what Option B below produces.
+
+## Option B - build it yourself (advanced)
 
 Requirements: Linux x86_64, ~8 GB free disk, and
 `gcc g++ make bc openssl python3 binutils curl tar libssl-dev`.
@@ -142,7 +193,7 @@ Tested baseline: LineageOS 22.2 nightly 20260816 (kernel `59220a048d04`).
 Your data is untouched (only the boot partition changes) and rollback is
 always possible: `fastboot flash boot <original boot.img>`.
 
-## Option B - for ROM & kernel maintainers
+## Option C - for ROM & kernel maintainers
 
 Apply [`patches/0001-firmware-switch-NT36xxx-blobs-to-V12.5.5.0.patch`](patches/0001-firmware-switch-NT36xxx-blobs-to-V12.5.5.0.patch)
 onto your kernel tree:
@@ -198,8 +249,9 @@ reporting.
 ## Good to know
 
 - **Every LineageOS OTA replaces the boot partition** and thus removes the
-  fix. After every LineageOS update, rebuild the fix using the boot.img from
-  that exact build - do not reflash images built for older builds.
+  fix. After every LineageOS update, flash the release matching the new
+  build (or rebuild with the script and that build's boot.img) - never
+  flash an image built for a different build date.
 - Enable **Developer options → Pointer location** to make ghost touches
   visible while testing. Typical triggers: charging (especially cheap
   chargers), a warm device, low battery.
